@@ -116,10 +116,16 @@ def main():
     odrv.axis1.controller.config.vel_ramp_rate = 0.5
 
     odrv.axis0.controller.config.vel_gain = 1.5 # 2.3
-    odrv.axis1.controller.config.vel_gain = 2.3 # 1.5
+    odrv.axis1.controller.config.vel_gain = 1.5 # 1.5
 
     odrv.axis0.controller.config.vel_integrator_gain = 4.5
     odrv.axis1.controller.config.vel_integrator_gain = 4.5
+
+    # Bandwidth settings (higher = more responsive, but noisier with Hall sensors)
+    odrv.axis0.motor.config.current_control_bandwidth = 1000  # Current loop bandwidth (Hz)
+    odrv.axis1.motor.config.current_control_bandwidth = 1000
+    odrv.axis0.encoder.config.bandwidth = 60  # Encoder filter bandwidth (Hz)
+    odrv.axis1.encoder.config.bandwidth = 60
 
     # Show current PID gains
     print(f"\n{BLUE}Current PID gains:{RESET}")
@@ -143,7 +149,7 @@ def main():
 
     # Test speeds (in turns/sec - ODrive uses encoder counts)
     # Start with VERY low speed for stand testing to prevent wheel slip
-    move_speed = 1.5  # turns per second for forward/backward (reduced from 1.0)
+    move_speed = 0.6  # turns per second for forward/backward (reduced from 1.0)
     turn_speed = 0.3  # turns per second for turning (reduced from 0.5)
 
     print(f"{YELLOW}Controls:{RESET}")
@@ -154,7 +160,7 @@ def main():
     print("  SPACE - Stop")
     print("  +/- - Increase/Decrease move speed")
     print("  [/] - Increase/Decrease turn speed")
-    print("  (Speed display: actual/target in turns/sec)")
+    print("  X - Toggle steering correction (PI loop)")
     print("  R - Adjust ramp rate")
     print("  ESC - Exit")
     print(f"\nMove speed: {YELLOW}{move_speed:.1f}{RESET} turns/sec")
@@ -163,26 +169,59 @@ def main():
 
     last_command = None  # Track the last movement command
     last_monitor_time = 0
-    current_ramp_rate = 0.5  # Track current ramp rate
+    current_ramp_rate = 0.1  # Track current ramp rate
     status_msg = "STOP"  # Current command status
+
+    # Steering correction PI controller (runs on Pi)
+    steer_correction_enabled = False
+    Kp_steer = 1.5   # Proportional gain for steering correction
+    Ki_steer = 1.0   # Integral gain for steering correction
+    steer_integral = 0.0
+    steer_integral_limit = 0.5  # Anti-windup limit
+    last_correction_time = time.time()
 
     with RawInput() as raw_input:
         try:
             while True:
-                # Always display wheel speed at ~60Hz on two lines
                 current_time = time.time()
-                if (current_time - last_monitor_time) > 0.016:  # ~60Hz update
-                    vel0 = odrv.axis0.encoder.vel_estimate
-                    vel1 = odrv.axis1.encoder.vel_estimate
+                dt = current_time - last_correction_time
+
+                # Read wheel velocities
+                vel0 = odrv.axis0.encoder.vel_estimate
+                vel1 = odrv.axis1.encoder.vel_estimate
+
+                # Fwd = -vel0 + vel1 (positive=forward, since L is negated)
+                # Steer = vel0 + vel1 (positive=turning left, negative=turning right)
+                fwd = -vel0 + vel1
+                steer = vel0 + vel1
+
+                # Apply steering correction when going straight (W/S commands)
+                if steer_correction_enabled and last_command in ['w', 's'] and dt > 0.01:
+                    # Steer error: we want steer = 0
+                    steer_error = 0 - steer
+
+                    # PI controller
+                    steer_integral += steer_error * dt
+                    steer_integral = max(-steer_integral_limit, min(steer_integral_limit, steer_integral))
+
+                    delta_v = Kp_steer * steer_error + Ki_steer * steer_integral
+
+                    # Apply correction: vR += delta_v, vL -= delta_v
+                    base_speed = move_speed if last_command == 'w' else -move_speed
+                    corrected_vel0 = -base_speed - delta_v  # L (negated)
+                    corrected_vel1 = base_speed + delta_v   # R
+
+                    odrv.axis0.controller.input_vel = corrected_vel0
+                    odrv.axis1.controller.input_vel = corrected_vel1
+
+                    last_correction_time = current_time
+
+                # Display at ~60Hz
+                if (current_time - last_monitor_time) > 0.016:
                     input0 = odrv.axis0.controller.input_vel
                     input1 = odrv.axis1.controller.input_vel
-                    # Use ANSI escape to show status on line above speed
-                    # \033[2K clears line, \033[A moves up, \r returns to start
-                    # Fwd = -vel0 + vel1 (positive=forward, since L is negated)
-                    # Steer = vel0 + vel1 (positive=turning left, negative=turning right)
-                    fwd = -vel0 + vel1
-                    steer = vel0 + vel1
-                    sys.stdout.write(f"\r\033[K{YELLOW}[Cmd]{RESET} {status_msg}\n")
+                    corr_status = "ON" if steer_correction_enabled else "OFF"
+                    sys.stdout.write(f"\r\033[K{YELLOW}[Cmd]{RESET} {status_msg} | Corr:{corr_status}\n")
                     sys.stdout.write(f"\r\033[K{BLUE}[Speed]{RESET} L:{vel0:+.2f} R:{vel1:+.2f} | Fwd:{fwd:+.2f} Steer:{steer:+.2f}\033[A")
                     sys.stdout.flush()
                     last_monitor_time = current_time
@@ -196,21 +235,25 @@ def main():
                     break
                 elif key == 'w' or key == 'W':
                     last_command = 'w'
+                    steer_integral = 0.0  # Reset integral when starting new motion
                     status_msg = f"↑ Forward ({move_speed:.1f} t/s)"
                     odrv.axis0.controller.input_vel = -move_speed  # Left motor reversed
                     odrv.axis1.controller.input_vel = move_speed
                 elif key == 's' or key == 'S':
                     last_command = 's'
+                    steer_integral = 0.0  # Reset integral when starting new motion
                     status_msg = f"↓ Backward ({move_speed:.1f} t/s)"
                     odrv.axis0.controller.input_vel = move_speed   # Left motor reversed
                     odrv.axis1.controller.input_vel = -move_speed
                 elif key == 'a' or key == 'A':
                     last_command = 'a'
+                    steer_integral = 0.0
                     status_msg = f"← Left turn ({turn_speed:.1f} t/s)"
                     odrv.axis0.controller.input_vel = turn_speed   # Left backward (reversed motor)
                     odrv.axis1.controller.input_vel = turn_speed   # Right forward
                 elif key == 'd' or key == 'D':
                     last_command = 'd'
+                    steer_integral = 0.0
                     status_msg = f"→ Right turn ({turn_speed:.1f} t/s)"
                     odrv.axis0.controller.input_vel = -turn_speed  # Left forward (reversed motor)
                     odrv.axis1.controller.input_vel = -turn_speed  # Right backward
@@ -236,12 +279,18 @@ def main():
                     odrv.axis1.controller.input_vel = -move_speed
                 elif key == ' ':
                     last_command = None
+                    steer_integral = 0.0  # Reset steering correction integral
                     status_msg = "⏹ STOP"
                     odrv.axis0.controller.input_vel = 0
                     odrv.axis1.controller.input_vel = 0
                     # Reset the velocity integrators to prevent residual rotation
                     odrv.axis0.controller.vel_integrator_torque = 0
                     odrv.axis1.controller.vel_integrator_torque = 0
+                elif key == 'x' or key == 'X':
+                    # Toggle steering correction
+                    steer_correction_enabled = not steer_correction_enabled
+                    steer_integral = 0.0
+                    status_msg = f"Steer correction: {'ON' if steer_correction_enabled else 'OFF'}"
                 elif key == '+' or key == '=':
                     move_speed = min(move_speed + 0.5, 10.0)
                     status_msg = f"Move speed: {move_speed:.1f} t/s"
