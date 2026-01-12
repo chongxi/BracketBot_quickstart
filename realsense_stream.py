@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
-"""Flask app to stream RealSense D415 RGB + Depth over HTTP
+"""Flask app to stream RealSense D415 RGB + Depth over HTTP using pyrealsense2
 
 Usage:
-    python realsense_stream.py [rgb_device] [depth_device]
-
-Examples:
-    python realsense_stream.py              # Use defaults (video4 RGB, video0 depth)
-    python realsense_stream.py 4 0          # Explicit devices
+    python realsense_stream.py
 """
 
 import cv2
 from flask import Flask, Response
 import threading
 import time
-import sys
 import numpy as np
+import pyrealsense2 as rs
 
 app = Flask(__name__)
-
-# Parse device arguments
-rgb_device = int(sys.argv[1]) if len(sys.argv) > 1 else 4
-depth_device = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
 # Global variables for thread-safe camera access
 output_frame = None
@@ -31,99 +23,76 @@ DEPTH_MIN = 200    # 20cm
 DEPTH_MAX = 5000   # 5m
 
 
-def depth_to_colormap(depth_raw):
-    """Convert raw 16-bit depth to colorized image.
-
-    D415 depth is in Z16 format (16-bit unsigned, values in mm).
-    """
-    # Clip to valid range
-    depth_clipped = np.clip(depth_raw, DEPTH_MIN, DEPTH_MAX)
-
-    # Normalize to 0-255
-    depth_normalized = ((depth_clipped - DEPTH_MIN) / (DEPTH_MAX - DEPTH_MIN) * 255).astype(np.uint8)
-
-    # Apply colormap (TURBO gives good depth visualization)
-    depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_TURBO)
-
-    return depth_colored
-
-
 def camera_thread():
-    """Continuously capture frames from both cameras"""
+    """Continuously capture frames using RealSense SDK"""
     global output_frame
 
-    # Open RGB camera
-    print(f"Opening RGB: /dev/video{rgb_device}...")
-    cap_rgb = cv2.VideoCapture(rgb_device)
-    cap_rgb.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap_rgb.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap_rgb.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap_rgb.set(cv2.CAP_PROP_FPS, 30)
-    print(f"RGB opened: {cap_rgb.isOpened()}")
+    # Configure RealSense pipeline
+    pipeline = rs.pipeline()
+    config = rs.config()
 
-    # Open Depth camera
-    print(f"Opening Depth: /dev/video{depth_device}...")
-    cap_depth = cv2.VideoCapture(depth_device)
-    cap_depth.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap_depth.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap_depth.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap_depth.set(cv2.CAP_PROP_FPS, 30)
-    # Set format to Z16 (16-bit depth)
-    cap_depth.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Z', '1', '6', ' '))
-    print(f"Depth opened: {cap_depth.isOpened()}")
+    # Enable streams (both at 15fps to avoid sync issues)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
-    # Warm up
-    time.sleep(1)
-    for _ in range(10):
-        cap_rgb.read()
-        cap_depth.read()
+    # Start pipeline
+    print("Starting RealSense pipeline...")
+    try:
+        profile = pipeline.start(config)
+    except Exception as e:
+        print(f"Failed to start pipeline: {e}")
+        return
+
+    # Get device info
+    device = profile.get_device()
+    print(f"Device: {device.get_info(rs.camera_info.name)}")
+    print(f"Serial: {device.get_info(rs.camera_info.serial_number)}")
+
+    # Align depth to color camera viewpoint
+    align = rs.align(rs.stream.color)
+
+    # Create colorizer for depth visualization
+    colorizer = rs.colorizer()
+    colorizer.set_option(rs.option.color_scheme, 0)  # 0 = Jet colormap (blue=near, red=far)
+
+    # Set depth range (D415 min reliable range is ~0.3m)
+    colorizer.set_option(rs.option.min_distance, 0.3)  # 0.3m min
+    colorizer.set_option(rs.option.max_distance, 4.0)  # 4m max
 
     print("Streaming started...")
 
-    while True:
-        # Capture RGB
-        ret_rgb, frame_rgb = cap_rgb.read()
-        if not ret_rgb:
-            continue
+    try:
+        while True:
+            # Wait for frames
+            frames = pipeline.wait_for_frames()
 
-        # Capture Depth
-        ret_depth, frame_depth = cap_depth.read()
-        if not ret_depth:
-            # If depth fails, just show RGB with blank depth
-            depth_colored = np.zeros_like(frame_rgb)
-        else:
-            # Convert depth frame to 16-bit
-            # OpenCV may read it as 8-bit, need to handle both cases
-            if frame_depth.dtype == np.uint8:
-                # If read as BGR, convert to grayscale and interpret as 16-bit
-                if len(frame_depth.shape) == 3:
-                    # Take first two channels as low/high bytes
-                    depth_raw = frame_depth[:, :, 0].astype(np.uint16) + \
-                                (frame_depth[:, :, 1].astype(np.uint16) << 8)
-                else:
-                    depth_raw = frame_depth.astype(np.uint16)
-            else:
-                depth_raw = frame_depth
+            # Align depth to color viewpoint (reduces parallax artifacts)
+            aligned_frames = align.process(frames)
 
-            # Ensure 2D array
-            if len(depth_raw.shape) == 3:
-                depth_raw = depth_raw[:, :, 0]
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
 
-            depth_colored = depth_to_colormap(depth_raw)
+            if not color_frame or not depth_frame:
+                continue
 
-        # Resize depth to match RGB if needed
-        if depth_colored.shape[:2] != frame_rgb.shape[:2]:
-            depth_colored = cv2.resize(depth_colored, (frame_rgb.shape[1], frame_rgb.shape[0]))
+            # Convert to numpy arrays
+            frame_rgb = np.asanyarray(color_frame.get_data())
 
-        # Combine side-by-side
-        combined = np.hstack([frame_rgb, depth_colored])
+            # Colorize aligned depth
+            depth_colorized = np.asanyarray(colorizer.colorize(depth_frame).get_data())
 
-        # Add labels
-        cv2.putText(combined, "RGB", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(combined, "Depth", (frame_rgb.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            # Combine side-by-side
+            combined = np.hstack([frame_rgb, depth_colorized])
 
-        with lock:
-            output_frame = combined.copy()
+            # Add labels
+            cv2.putText(combined, "RGB", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(combined, "Depth", (frame_rgb.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            with lock:
+                output_frame = combined.copy()
+
+    finally:
+        pipeline.stop()
 
 
 def generate_frames():

@@ -1,6 +1,6 @@
 import sys
 import os
-# import pyrealsense2 as rs
+import pyrealsense2 as rs
 import cv2
 import numpy as np
 
@@ -140,7 +140,7 @@ class StereoCamera:
 
 if __name__ == "__main__":
     realsense = RealsenseCamera()
-    usb = USBCamera()
+    # usb = USBCamera()
     
     # Example usage of StereoCamera
     stereo_cam = StereoCamera(0, scale=0.5)  # Initialize with 50% scaling
