@@ -22,8 +22,8 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # Settings
-DOWNSAMPLE = 2
-MAX_POINTS = 30000
+DOWNSAMPLE = 3  # Downsample factor for point cloud
+MAX_POINTS = 50000
 
 
 HTML_TEMPLATE = '''
